@@ -152,8 +152,12 @@ unet_teacher.requires_grad_(False)
 decoder.requires_grad_(False)
 DAPE.requires_grad_(False)
 
-model = DDP(Net(unet, copy.deepcopy(decoder)).to(device), device_ids=[rank])
-model_D = DDP(unet_D.to(device), device_ids=[rank])
+# Keep trainable parameters in fp32 to avoid GradScaler unscale issues when running in
+# lower-precision modes (e.g., fp16). Autocast will still use reduced precision for
+# compute, but master weights remain in fp32 for stability.
+student_model = Net(unet, copy.deepcopy(decoder)).to(device=device, dtype=torch.float32)
+model = DDP(student_model, device_ids=[rank])
+model_D = DDP(unet_D.to(device=device, dtype=torch.float32), device_ids=[rank])
 model.requires_grad_(True)
 model_D.requires_grad_(False)
 params_to_opt = []
