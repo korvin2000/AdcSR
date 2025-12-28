@@ -25,6 +25,14 @@ parser.add_argument("--learning_rate", type=float, default=1e-4)
 parser.add_argument("--model_dir", type=str, default="weight")
 parser.add_argument("--log_dir", type=str, default="log")
 parser.add_argument("--save_interval", type=int, default=10)
+parser.add_argument("--torch_dtype", type=str, choices=["fp16", "bf16", "fp32"], default="fp16",
+                    help="dtype used to load diffusion backbone to reduce VRAM usage")
+parser.add_argument("--enable_gradient_checkpointing", action="store_true",
+                    help="turn on gradient checkpointing for UNet modules")
+parser.add_argument("--enable_attention_slicing", action="store_true",
+                    help="enable attention slicing to reduce peak memory in attention layers")
+parser.add_argument("--use_xformers", action="store_true",
+                    help="enable xFormers memory efficient attention if available")
 
 args = parser.parse_args()
 
@@ -41,16 +49,31 @@ epoch = args.epoch
 learning_rate = args.learning_rate
 bsz = args.batch_size
 
+torch_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[args.torch_dtype]
+
 device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.matmul.allow_tf32 = True
 
 if rank == 0:
     print("batch size per gpu =", bsz)
+    print(f"backbone dtype = {torch_dtype}")
 
 from diffusers import StableDiffusionPipeline
 model_id = "stabilityai/stable-diffusion-2-1-base"
-pipe = StableDiffusionPipeline.from_pretrained(model_id).to(device)
+pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch_dtype)
+
+if args.enable_attention_slicing:
+    pipe.enable_attention_slicing()
+
+if args.use_xformers:
+    try:
+        pipe.enable_xformers_memory_efficient_attention()
+    except Exception as exc:  # pragma: no cover - optional dependency
+        if rank == 0:
+            print(f"[warn] failed to enable xFormers attention: {exc}")
+
+pipe.to(device)
 
 vae = pipe.vae
 tokenizer = pipe.tokenizer
@@ -58,12 +81,23 @@ unet = pipe.unet
 text_encoder = pipe.text_encoder
 
 unet_D = copy.deepcopy(unet)
-new_conv_in = torch.nn.Conv2d(256, 320, 3, padding=1).to(device)
+new_conv_in = torch.nn.Conv2d(
+    256, 320, 3, padding=1, device=device, dtype=unet_D.conv_in.weight.dtype
+)
 new_conv_in.weight.data = unet_D.conv_in.weight.data.repeat(1, 64, 1, 1) / 64
 new_conv_in.bias.data = unet_D.conv_in.bias.data
 unet_D.conv_in = new_conv_in
 unet_D = add_lora_to_unet(unet_D)
 unet_D.set_adapters(["default_encoder", "default_decoder", "default_others"])
+
+if args.enable_gradient_checkpointing:
+    unet_D.enable_gradient_checkpointing()
+    unet.enable_gradient_checkpointing()
+    pipe.text_encoder.gradient_checkpointing_enable()
+
+if args.enable_attention_slicing:
+    unet.enable_attention_slicing()
+    unet_D.enable_attention_slicing()
 
 vae_teacher = copy.deepcopy(vae)
 unet_teacher = copy.deepcopy(unet)
@@ -71,6 +105,15 @@ unet_teacher = copy.deepcopy(unet)
 osediff = torch.load("./weight/pretrained/osediff.pkl", weights_only=False)
 vae_teacher.load_state_dict(osediff["vae"])
 unet_teacher.load_state_dict(osediff["unet"])
+
+vae_teacher.to(device=device, dtype=torch_dtype)
+unet_teacher.to(device=device, dtype=torch_dtype)
+
+if args.enable_gradient_checkpointing:
+    unet_teacher.enable_gradient_checkpointing()
+
+if args.enable_attention_slicing:
+    unet_teacher.enable_attention_slicing()
 
 from diffusers.models.autoencoders.vae import Decoder 
 ckpt_halfdecoder = torch.load("./weight/pretrained/halfDecoder.ckpt", weights_only=False)
@@ -82,7 +125,9 @@ decoder = Decoder(in_channels=4,
                   norm_num_groups=32,
                   act_fn="silu",
                   norm_type="group",
-                  mid_block_add_attention=True).to(device)
+                  mid_block_add_attention=True,
+                  dtype=torch_dtype,
+                  device=device)
 decoder_ckpt = {}
 for k, v in ckpt_halfdecoder["state_dict"].items():
     if "decoder" in k:
@@ -98,7 +143,7 @@ ram_transforms = transforms.Compose([
 DAPE = ram(pretrained="./weight/pretrained/ram_swin_large_14m.pth",
            pretrained_condition="./weight/pretrained/DAPE.pth",
            image_size=384,
-           vit="swin_l").eval().to(device)
+           vit="swin_l").eval().to(device=device, dtype=torch_dtype)
 
 vae.requires_grad_(False)
 unet.requires_grad_(False)

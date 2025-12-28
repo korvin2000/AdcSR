@@ -41,7 +41,9 @@ def halve_channels(model):
                                  padding=module.padding,
                                  dilation=module.dilation,
                                  groups=module.groups,
-                                 bias=module.bias is not None)
+                                 bias=module.bias is not None,
+                                 device=module.weight.device,
+                                 dtype=module.weight.dtype)
             with torch.no_grad():
                 new_conv.weight.copy_(module.weight[:out_channels, :in_channels])
                 if module.bias is not None:
@@ -54,7 +56,9 @@ def halve_channels(model):
             out_features = int(module.out_features * 0.75)
             new_linear = nn.Linear(in_features=in_features,
                                    out_features=out_features,
-                                   bias=module.bias is not None)
+                                   bias=module.bias is not None,
+                                   device=module.weight.device,
+                                   dtype=module.weight.dtype)
             with torch.no_grad():
                 new_linear.weight.copy_(module.weight[:out_features, :in_features])
                 if module.bias is not None:
@@ -70,7 +74,9 @@ def halve_channels(model):
             new_gn = nn.GroupNorm(num_groups=num_groups,
                                   num_channels=num_channels,
                                   eps=module.eps,
-                                  affine=module.affine)
+                                  affine=module.affine,
+                                  device=module.weight.device,
+                                  dtype=module.weight.dtype)
             with torch.no_grad():
                 new_gn.weight.copy_(module.weight[:num_channels])
                 new_gn.bias.copy_(module.bias[:num_channels])
@@ -79,9 +85,11 @@ def halve_channels(model):
             new_gn.pruned = True
         elif isinstance(module, nn.LayerNorm):
             normalized_shape = int(module.normalized_shape[0] * 0.75)
-            new_ln = nn.LayerNorm(normalized_shape, 
-                                  eps=module.eps, 
-                                  elementwise_affine=module.elementwise_affine)
+            new_ln = nn.LayerNorm(normalized_shape,
+                                  eps=module.eps,
+                                  elementwise_affine=module.elementwise_affine,
+                                  device=module.weight.device,
+                                  dtype=module.weight.dtype)
             with torch.no_grad():
                 new_ln.weight.copy_(module.weight[:normalized_shape])
                 new_ln.bias.copy_(module.bias[:normalized_shape])
@@ -95,11 +103,15 @@ class Net(nn.Module):
     def __init__(self, unet, decoder):
         super().__init__()
         del unet.time_embedding
-        new_conv_in = nn.Conv2d(16, 320, 3, padding=1)
+        new_conv_in = nn.Conv2d(16, 320, 3, padding=1,
+                                device=unet.conv_in.weight.device,
+                                dtype=unet.conv_in.weight.dtype)
         new_conv_in.weight.data = unet.conv_in.weight.data.repeat(1, 4, 1, 1)
         new_conv_in.bias.data = unet.conv_in.bias.data
         unet.conv_in = new_conv_in
-        new_conv_out = nn.Conv2d(320, 342, 3, padding=1)
+        new_conv_out = nn.Conv2d(320, 342, 3, padding=1,
+                                 device=unet.conv_out.weight.device,
+                                 dtype=unet.conv_out.weight.dtype)
         new_conv_out.weight.data = unet.conv_out.weight.data.repeat(86, 1, 1, 1)[:342]
         new_conv_out.bias.data = unet.conv_out.bias.data.repeat(86,)[:342]
         unet.conv_out = new_conv_out
