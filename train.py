@@ -50,6 +50,9 @@ learning_rate = args.learning_rate
 bsz = args.batch_size
 
 torch_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[args.torch_dtype]
+use_autocast = torch_dtype != torch.float32
+autocast_dtype = torch.bfloat16 if torch_dtype == torch.bfloat16 else torch.float16
+use_grad_scaler = torch_dtype == torch.float16
 
 device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
 torch.backends.cudnn.allow_tf32 = True
@@ -176,7 +179,8 @@ dataloader = DataLoader(dataset, batch_size=bsz, num_workers=8)
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 optimizer_D = torch.optim.Adam(params_to_opt, lr=1e-6)
 scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[100,], gamma=0.5)
-scaler = torch.cuda.amp.GradScaler()
+scaler_G = torch.cuda.amp.GradScaler(enabled=use_grad_scaler)
+scaler_D = torch.cuda.amp.GradScaler(enabled=use_grad_scaler)
 
 model_dir = "./%s" % (args.model_dir,)
 log_path = "./%s/log.txt" % (args.log_dir,)
@@ -185,7 +189,11 @@ os.makedirs(args.log_dir, exist_ok=True)
 
 print("start training...")
 timesteps = torch.tensor([999], device=device).long().expand(bsz,)
-alpha = pipe.scheduler.alphas_cumprod[999]
+alpha = pipe.scheduler.alphas_cumprod[999].to(device=device, dtype=torch.float32)
+alpha = torch.clamp(alpha, min=1e-6, max=1 - 1e-6)
+sqrt_alpha = torch.sqrt(alpha)
+sqrt_one_minus_alpha = torch.sqrt(1 - alpha)
+max_grad_norm = 1.0
 for epoch_i in range(1, epoch + 1):
     start_time = time()
     loss_avg = 0.0
@@ -195,7 +203,7 @@ for epoch_i in range(1, epoch + 1):
     iter_num = 0
     dist.barrier()
     for batch in tqdm(dataloader):
-        with torch.cuda.amp.autocast(enabled=True):
+        with torch.cuda.amp.autocast(enabled=use_autocast, dtype=autocast_dtype):
             with torch.no_grad():
                 LR, HR = degrader.degrade(batch)
                 text_input = tokenizer(DAPE.generate_tag(ram_transforms(LR))[0],
@@ -212,7 +220,7 @@ for epoch_i in range(1, epoch + 1):
                     encoder_hidden_states=encoder_hidden_states,
                     return_dict=False,
                 )[0]
-                z0_teacher = (LR_latents-((1-alpha)**0.5)*pred_teacher)/(alpha**0.5)
+                z0_teacher = (LR_latents - sqrt_one_minus_alpha * pred_teacher) / sqrt_alpha
                 z0_teacher = vae_teacher.post_quant_conv(z0_teacher / vae_teacher.config.scaling_factor)
                 z0_teacher = decoder.conv_in(z0_teacher)
                 z0_teacher = decoder.mid_block(z0_teacher)
@@ -220,19 +228,28 @@ for epoch_i in range(1, epoch + 1):
                 z0_gt = decoder.conv_in(z0_gt)
                 z0_gt = decoder.mid_block(z0_gt)
             z0_student = model(LR)
-            loss_distil = (z0_student - z0_teacher).abs().mean()
-            loss_adv = F.softplus(-model_D(
+            pred_fake_for_G = model_D(
                 z0_student,
                 timesteps,
                 encoder_hidden_states=encoder_hidden_states,
                 return_dict=False,
-            )[0]).mean()
+            )[0]
+
+        with torch.cuda.amp.autocast(enabled=False):
+            z0_student_f32 = z0_student.float()
+            z0_teacher_f32 = z0_teacher.float()
+            loss_distil = (z0_student_f32 - z0_teacher_f32).abs().mean()
+            loss_adv = F.softplus(-pred_fake_for_G.float()).mean()
             loss = loss_distil + loss_adv
+
         optimizer.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        with torch.cuda.amp.autocast(enabled=True):
+        scaler_G.scale(loss).backward()
+        scaler_G.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        scaler_G.step(optimizer)
+        scaler_G.update()
+
+        with torch.cuda.amp.autocast(enabled=use_autocast, dtype=autocast_dtype):
             pred_real = model_D(
                 z0_gt.detach(),
                 timesteps,
@@ -245,11 +262,16 @@ for epoch_i in range(1, epoch + 1):
                 encoder_hidden_states=encoder_hidden_states,
                 return_dict=False,
             )[0]
-            loss_D = F.softplus(pred_fake).mean() + F.softplus(-pred_real).mean()
+
+        with torch.cuda.amp.autocast(enabled=False):
+            loss_D = F.softplus(pred_fake.float()).mean() + F.softplus(-pred_real.float()).mean()
+
         optimizer_D.zero_grad(set_to_none=True)
-        scaler.scale(loss_D).backward()
-        scaler.step(optimizer_D)
-        scaler.update()
+        scaler_D.scale(loss_D).backward()
+        scaler_D.unscale_(optimizer_D)
+        torch.nn.utils.clip_grad_norm_(params_to_opt, max_grad_norm)
+        scaler_D.step(optimizer_D)
+        scaler_D.update()
         loss_avg += loss.item()
         loss_distil_avg += loss_distil.item()
         loss_adv_avg += loss_adv.item()
