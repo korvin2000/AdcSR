@@ -116,6 +116,25 @@ This repo provides code for **Stage 2** training (**adversarial distillation**).
    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m torch.distributed.run --nproc_per_node=8 --master_port=23333 train.py
    ```
    The trained model will be saved in `./weight/`.
+
+### Reduce VRAM usage
+
+If you need to fit training on a single 24 GB GPU, enable the built-in memory optimizations:
+
+- Load backbones in mixed precision and keep trainable layers light:
+  ```bash
+  python -m torch.distributed.run --nproc_per_node=1 train.py --batch_size=1 --torch_dtype=fp16
+  ```
+- Turn on gradient checkpointing to trade extra compute for smaller activations:
+  ```bash
+  ... train.py --enable_gradient_checkpointing
+  ```
+- Enable attention slicing (and xFormers if installed) to shrink attention memory spikes:
+  ```bash
+  ... train.py --enable_attention_slicing --use_xformers
+  ```
+- Keep non-trainable teachers and feature extractors in half precision (default) and avoid large kernels by lowering `gt_size` and
+  data augmentations in `config.yml` when debugging.
    
 ## 🥰 Acknowledgement
 
