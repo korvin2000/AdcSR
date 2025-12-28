@@ -125,15 +125,14 @@ decoder = Decoder(in_channels=4,
                   norm_num_groups=32,
                   act_fn="silu",
                   norm_type="group",
-                  mid_block_add_attention=True,
-                  dtype=torch_dtype,
-                  device=device)
+                  mid_block_add_attention=True)
 decoder_ckpt = {}
 for k, v in ckpt_halfdecoder["state_dict"].items():
     if "decoder" in k:
         new_k = k.replace("decoder.", "")
         decoder_ckpt[new_k] = v
 decoder.load_state_dict(decoder_ckpt, strict=True)
+decoder.to(device=device, dtype=torch_dtype)
 
 ram_transforms = transforms.Compose([
     transforms.Resize((384, 384)),
